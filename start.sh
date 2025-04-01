@@ -1,13 +1,15 @@
 #!/bin/bash
 
-PRIV_VALIDATOR_KEY_FILE=${"$HOME/priv_validator_key.json"}
-NODE_KEY_FILE=${"$HOME/node_key.json"}
+PRIV_VALIDATOR_KEY_FILE="$HOME/priv_validator_key.json"
+NODE_KEY_FILE="$HOME/node_key.json"
 NODE_HOME=~/.kiichain3
-NODE_MONIKER="devnet_oro-validator-$VALIDATOR_INDEX"
+NODE_MONIKER="devnet-validator-0"
+VALIDATOR_KEY_NAME="devnet_validator"
 SERVICE_NAME=kiichain3
 SERVICE_VERSION="v2.0.0"
 CHAIN_BINARY='kiichaind'
 CHAIN_ID=kiichain3
+APP_TOML_PATH="$HOME/.kiichain3/config/app.toml"
 GENESIS_URL=https://raw.githubusercontent.com/KiiChain/testnets/refs/heads/main/testnet_oro/genesis.json
 
 # Stop and clean previous installations
@@ -29,6 +31,7 @@ wget https://go.dev/dl/go1.22.10.linux-amd64.tar.gz
 sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go1.22.10.linux-amd64.tar.gz
 export PATH=$PATH:/usr/local/go/bin
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.profile
+rm go1.22.10.linux-amd64.tar.gz
 
 # Install Kiichain binary
 echo "Installing Kiichain..."
@@ -42,14 +45,46 @@ make install
 export PATH=$PATH:$HOME/go/bin
 echo 'export PATH=$PATH:$HOME/go/bin' >> ~/.profile
 
-# Download the official genesis file
+# Init chain and replace genesis
 echo "Downloading official genesis.json..."
-mkdir -p $NODE_HOME/config
-curl -s $GENESIS_URL -o $NODE_HOME/config/genesis.json
+$CHAIN_BINARY init $NODE_MONIKER --chain-id $CHAIN_ID --home $NODE_HOME
+# curl -s $GENESIS_URL -o $NODE_HOME/config/genesis.json
 
 # Set genesis with desired values
+echo "Modifying genesis.json with required configurations..."
+
+# Delete validators from the genesis file
+jq '.validators = []' $NODE_HOME/config/genesis.json > temp.json && mv temp.json $NODE_HOME/config/genesis.json 
+
+# Modify desired parameters in the genesis file using jq
 sed -i 's/"voting_period": *"[^"]*"/"voting_period": "240s"/' $NODE_HOME/config/genesis.json
 sed -i 's/"expedited_voting_period": *"[^"]*"/"expedited_voting_period": "120s"/' $NODE_HOME/config/genesis.json
+sed -i 's/mode = "full"/mode = "validator"/g' $NODE_HOME/config/config.toml
+
+# Modify testnet-specific configuration
+cat $NODE_HOME/config/genesis.json | jq '.app_state["gov"]["deposit_params"]["max_deposit_period"]="60s"' > $NODE_HOME/config/tmp_genesis.json && mv $NODE_HOME/config/tmp_genesis.json $NODE_HOME/config/genesis.json
+cat $NODE_HOME/config/genesis.json | jq '.app_state["gov"]["voting_params"]["voting_period"]="30s"' > $NODE_HOME/config/tmp_genesis.json && mv $NODE_HOME/config/tmp_genesis.json $NODE_HOME/config/genesis.json
+cat $NODE_HOME/config/genesis.json | jq '.app_state["gov"]["voting_params"]["expedited_voting_period"]="10s"' > $NODE_HOME/config/tmp_genesis.json && mv $NODE_HOME/config/tmp_genesis.json $NODE_HOME/config/genesis.json
+cat $NODE_HOME/config/genesis.json | jq '.app_state["distribution"]["params"]["community_tax"]="0.000000000000000000"' > $NODE_HOME/config/tmp_genesis.json && mv $NODE_HOME/config/tmp_genesis.json $NODE_HOME/config/genesis.json
+cat $NODE_HOME/config/genesis.json | jq '.consensus_params["block"]["max_gas"]="35000000"' > $NODE_HOME/config/tmp_genesis.json && mv $NODE_HOME/config/tmp_genesis.json $NODE_HOME/config/genesis.json
+cat $NODE_HOME/config/genesis.json | jq '.app_state["staking"]["params"]["max_voting_power_ratio"]="1.000000000000000000"' > $NODE_HOME/config/tmp_genesis.json && mv $NODE_HOME/config/tmp_genesis.json $NODE_HOME/config/genesis.json
+cat $NODE_HOME/config/genesis.json | jq '.app_state["bank"]["denom_metadata"]=[{"denom_units":[{"denom":"ukii","exponent":0,"aliases":["ukii"]}],"base":"ukii","display":"ukii","name":"ukii","symbol":"ukii"}]' > $NODE_HOME/config/tmp_genesis.json && mv $NODE_HOME/config/tmp_genesis.json $NODE_HOME/config/genesis.json
+
+# Modify app.toml configurations
+sed -i.bak -e 's/# concurrency-workers = .*/concurrency-workers = 500/' $APP_TOML_PATH
+sed -i.bak -e 's/occ-enabled = .*/occ-enabled = true/' $APP_TOML_PATH
+sed -i.bak -e 's/sc-enable = .*/sc-enable = true/' $APP_TOML_PATH
+sed -i.bak -e 's/ss-enable = .*/ss-enable = true/' $APP_TOML_PATH
+
+# Create validator account
+echo "Creating validator account..."
+$CHAIN_BINARY keys add $VALIDATOR_KEY_NAME 
+VALIDATOR_ADDRESS=$($CHAIN_BINARY keys show $VALIDATOR_KEY_NAME -a )
+
+# Add validator into the genesis file
+$CHAIN_BINARY add-genesis-account $VALIDATOR_ADDRESS 1000000000ukii
+$CHAIN_BINARY gentx $VALIDATOR_KEY_NAME 1000000ukii --chain-id $CHAIN_ID
+$CHAIN_BINARY collect-gentxs
 
 # Install and configure Cosmovisor
 echo "Setting up Cosmovisor..."
@@ -79,7 +114,7 @@ After=network-online.target
 
 [Service]
 User=$USER
-ExecStart=$HOME/go/bin/cosmovisor run start --x-crisis-skip-assert-invariants --rpc.laddr tcp://0.0.0.0:26657 
+ExecStart=$HOME/go/bin/cosmovisor run start
 Restart=always
 RestartSec=3
 LimitNOFILE=50000
@@ -108,21 +143,4 @@ echo "***********************"
 # Load environment variables
 echo 'export PATH=$HOME/go/bin:$PATH' >> ~/.profile
 source ~/.profile
-
-# Give the blockchain some time to start
-echo "Wait time meanwhile the chain starts..."
-sleep 20
-
-# Create validator account
-echo "Creating validator account..."
-VALIDATOR_KEY_NAME="devnet_validator"
-$CHAIN_BINARY keys add $VALIDATOR_KEY_NAME --keyring-backend test 
-VALIDATOR_ADDRESS=$($CHAIN_BINARY keys show $VALIDATOR_KEY_NAME -a --keyring-backend test )
-
-echo "add funds to validator's account..."
-BASE_ACCOUNT_KEY_NAME="private_sale"
-$CHAIN_BINARY tx bank send $BASE_ACCOUNT_KEY_NAME $VALIDATOR_ADDRESS 100000000000ukii -y -b block --fees 21000ukii
-
-# Set node as validator
-sed -i 's/mode = "full"/mode = "validator"/g' $NODE_HOME/config/config.toml
 
